@@ -64,11 +64,19 @@ def get_source(server_id):
         return None
 
 
-def extract_rapidcloud(embed_url):
-    """Extract M3U8 from RapidCloud embed URL"""
+def extract_rapidcloud(embed_url, get_all_qualities=False):
+    """Extract M3U8 from RapidCloud embed URL
+    
+    Args:
+        embed_url: RapidCloud embed URL
+        get_all_qualities: If True, return all quality variants info
+    
+    Returns:
+        Tuple of (m3u8_url, tracks, qualities) where qualities is list of quality dicts
+    """
     source_match = re.search(r'embed-2/v2/e-1/([a-zA-Z0-9]+)', embed_url)
     if not source_match:
-        return None, []
+        return None, [], []
     
     source_id = source_match.group(1)
     api_url = f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={source_id}"
@@ -83,17 +91,38 @@ def extract_rapidcloud(embed_url):
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
             sources = data.get("sources", [])
+            tracks = data.get("tracks", [])
+            
             if sources:
                 m3u8 = sources[0].get("file") if isinstance(sources[0], dict) else sources[0]
-                tracks = data.get("tracks", [])
-                return m3u8, tracks
+                
+                # Return basic info
+                if not get_all_qualities:
+                    return m3u8, tracks, []
+                
+                # Return qualities info - note: actual quality parsing requires fetching master m3u8
+                # which is blocked by CDN without browser-like headers
+                qualities = [
+                    {"quality": "master", "m3u8_url": m3u8, "note": "Use with Referer: https://rapid-cloud.co/"}
+                ]
+                return m3u8, tracks, qualities
     except:
         pass
-    return None, []
+    return None, [], []
 
 
-def extract(slug, episode=1, type="sub"):
-    """Extract M3U8 from kaido.to"""
+def extract(slug, episode=1, type="sub", get_all_qualities=False):
+    """Extract M3U8 from kaido.to
+    
+    Args:
+        slug: Anime slug (e.g., 'one-piece-100')
+        episode: Episode number
+        type: 'sub' or 'dub'
+        get_all_qualities: If True, include quality variants info
+    
+    Returns:
+        Dict with success status and stream info
+    """
     episode_id = get_episode_id(slug, episode)
     if not episode_id:
         return {"success": False, "error": "Episode not found"}
@@ -133,12 +162,12 @@ def extract(slug, episode=1, type="sub"):
     if not embed_url:
         return {"success": False, "error": f"No {type} embed URL found"}
     
-    m3u8_url, tracks = extract_rapidcloud(embed_url)
+    m3u8_url, tracks, qualities = extract_rapidcloud(embed_url, get_all_qualities)
     
     if not m3u8_url:
         return {"success": False, "error": "Failed to extract M3U8 from rapidcloud"}
     
-    return {
+    result = {
         "success": True,
         "slug": slug,
         "episode": int(episode),
@@ -148,17 +177,33 @@ def extract(slug, episode=1, type="sub"):
         "server": used_server,
         "tracks": tracks,
     }
+    
+    if get_all_qualities:
+        result["qualities"] = qualities
+        result["fetch_headers"] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://rapid-cloud.co/",
+        }
+    
+    return result
 
 
 @app.route('/')
 def home():
     return jsonify({
         "name": "Kaido/RapidCloud Anime Extractor API",
+        "version": "2.0",
         "usage": "/api/extract?slug=anime-slug&episode=1&type=sub",
+        "features": {
+            "extract": "Get stream URL for anime episode",
+            "sources": "Get sources directly from embed URL"
+        },
         "examples": [
             "/api/extract?slug=one-piece-100&episode=1&type=sub",
-            "/api/extract?slug=monster-19&episode=1&type=sub"
-        ]
+            "/api/extract?slug=monster-19&episode=1&type=sub&qualities=true",
+            "/api/sources?url=https://rapid-cloud.co/embed-2/v2/e-1/VIDEO_ID"
+        ],
+        "note": "For CDN access, use headers: Referer: https://rapid-cloud.co/"
     })
 
 
@@ -167,6 +212,7 @@ def api_extract():
     slug = request.args.get('slug', '')
     episode = request.args.get('episode', 1)
     type_param = request.args.get('type', 'sub').lower()
+    get_all_qualities = request.args.get('qualities', 'false').lower() == 'true'
     
     if type_param not in ["sub", "dub"]:
         return jsonify({"success": False, "error": "Type must be 'sub' or 'dub'"}), 400
@@ -174,8 +220,36 @@ def api_extract():
     if not slug:
         return jsonify({"success": False, "error": "Missing slug parameter"}), 400
     
-    result = extract(slug, episode, type_param)
+    result = extract(slug, episode, type_param, get_all_qualities)
     return jsonify(result)
+
+
+@app.route('/api/sources')
+def api_sources():
+    """Direct endpoint to get sources from embed URL (for testing)"""
+    embed_url = request.args.get('url', '')
+    
+    if not embed_url:
+        return jsonify({"success": False, "error": "Missing url parameter"}), 400
+    
+    if 'rapid-cloud.co' not in embed_url:
+        return jsonify({"success": False, "error": "Only rapid-cloud.co URLs supported"}), 400
+    
+    m3u8_url, tracks, qualities = extract_rapidcloud(embed_url, get_all_qualities=True)
+    
+    if not m3u8_url:
+        return jsonify({"success": False, "error": "Failed to extract from rapidcloud"})
+    
+    return jsonify({
+        "success": True,
+        "m3u8_url": m3u8_url,
+        "tracks": tracks,
+        "qualities": qualities,
+        "fetch_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://rapid-cloud.co/",
+        }
+    })
 
 
 if __name__ == '__main__':
