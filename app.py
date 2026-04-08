@@ -1,6 +1,6 @@
 """
 Kaido.to / RapidCloud Anime Extractor API for Vercel (Flask)
-Extracts M3U8 from anime streaming sites
+Extracts M3U8 from anime streaming sites with quality variants support
 """
 
 import json
@@ -8,6 +8,12 @@ import re
 import os
 from flask import Flask, request, jsonify
 import urllib.request
+
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -64,6 +70,68 @@ def get_source(server_id):
         return None
 
 
+def parse_master_m3u8(master_url):
+    """Parse master m3u8 and return all quality variants
+    
+    Args:
+        master_url: URL to the master m3u8 playlist
+    
+    Returns:
+        List of quality dicts with url, height, resolution, bandwidth
+    """
+    if not CURL_CFFI_AVAILABLE:
+        return []
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://rapid-cloud.co/",
+        "Origin": "https://rapid-cloud.co",
+    }
+    
+    try:
+        resp = curl_requests.get(master_url, headers=headers, impersonate='chrome', timeout=30)
+        if resp.status_code != 200:
+            return []
+        
+        content = resp.text
+        if '#EXTM3U' not in content:
+            return []
+        
+        qualities = []
+        base_url = '/'.join(master_url.split('/')[:-1])
+        lines = content.strip().split('\n')
+        
+        for i, line in enumerate(lines):
+            if line.startswith('#EXT-X-STREAM-INF:'):
+                res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
+                bandwidth_match = re.search(r'BANDWIDTH=(\d+)', line)
+                
+                if res_match and i + 1 < len(lines):
+                    resolution = res_match.group(1)
+                    height = int(resolution.split('x')[1])
+                    bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
+                    
+                    playlist_url = lines[i + 1].strip()
+                    if not playlist_url.startswith('http'):
+                        playlist_url = f"{base_url}/{playlist_url}"
+                    
+                    qualities.append({
+                        "quality": f"{height}p",
+                        "height": height,
+                        "resolution": resolution,
+                        "bandwidth": bandwidth,
+                        "url": playlist_url
+                    })
+        
+        # Sort by height descending
+        qualities.sort(key=lambda x: x.get('height', 0), reverse=True)
+        return qualities
+        
+    except Exception as e:
+        print(f"Error parsing master m3u8: {e}")
+        return []
+
+
 def extract_rapidcloud(embed_url, get_all_qualities=False):
     """Extract M3U8 from RapidCloud embed URL
     
@@ -100,11 +168,15 @@ def extract_rapidcloud(embed_url, get_all_qualities=False):
                 if not get_all_qualities:
                     return m3u8, tracks, []
                 
-                # Return qualities info - note: actual quality parsing requires fetching master m3u8
-                # which is blocked by CDN without browser-like headers
-                qualities = [
-                    {"quality": "master", "m3u8_url": m3u8, "note": "Use with Referer: https://rapid-cloud.co/"}
-                ]
+                # Parse master m3u8 to get all quality variants
+                qualities = parse_master_m3u8(m3u8)
+                
+                if not qualities:
+                    # Fallback to just master
+                    qualities = [
+                        {"quality": "master", "height": None, "url": m3u8, "note": "Use with Referer: https://rapid-cloud.co/"}
+                    ]
+                
                 return m3u8, tracks, qualities
     except:
         pass
